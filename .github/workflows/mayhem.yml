@@ -45,7 +45,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Start analysis
+      - name: Run analysis
         uses: ForAllSecure/mcode-action@d495fdca21b1a98ee8c27a570e12bd38fca88310
         with:
           args: --image ${{ steps.meta.outputs.tags }}
