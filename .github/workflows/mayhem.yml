@@ -46,9 +46,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Run analysis
-        uses: ForAllSecure/mcode-action@646999ea42c7d603a9926f8949291e4a0567ba79
+        uses: ForAllSecure/mcode-action@v1
         with:
-          args: --image ghcr.io/ethan42/smoltcp:master --cmd /fuzz/target/x86_64-unknown-linux-gnu/release/packet_parser
+          args: --image ${{ steps.meta.outputs.tags }}
           sarif-output: sarif
           verbosity: debug
 
