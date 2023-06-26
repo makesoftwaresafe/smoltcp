@@ -37,6 +37,7 @@ use crate::config::{
     IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT,
 };
 use crate::iface::Routes;
+use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use crate::rand::Rand;
 #[cfg(feature = "socket-dns")]
@@ -372,14 +373,16 @@ impl<'a> IpPacket<'a> {
             #[cfg(feature = "socket-raw")]
             IpPacket::Raw((_, raw_packet)) => payload.copy_from_slice(raw_packet),
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
-            IpPacket::Udp((_, udp_repr, inner_payload)) => udp_repr.emit(
-                &mut UdpPacket::new_unchecked(payload),
-                &_ip_repr.src_addr(),
-                &_ip_repr.dst_addr(),
-                inner_payload.len(),
-                |buf| buf.copy_from_slice(inner_payload),
-                &caps.checksum,
-            ),
+            IpPacket::Udp((_, udp_repr, inner_payload)) => {
+                udp_repr.emit(
+                    &mut UdpPacket::new_unchecked(payload),
+                    &_ip_repr.src_addr(),
+                    &_ip_repr.dst_addr(),
+                    inner_payload.len(),
+                    |buf| buf.copy_from_slice(inner_payload),
+                    &caps.checksum,
+                );
+            }
             #[cfg(feature = "socket-tcp")]
             IpPacket::Tcp((_, mut tcp_repr)) => {
                 // This is a terrible hack to make TCP performance more acceptable on systems
@@ -416,7 +419,7 @@ impl<'a> IpPacket<'a> {
                 |buf| dhcp_repr.emit(&mut DhcpPacket::new_unchecked(buf)).unwrap(),
                 &caps.checksum,
             ),
-        }
+        };
     }
 }
 
@@ -453,20 +456,13 @@ impl Interface {
     /// Create a network interface using the previously provided configuration.
     ///
     /// # Panics
-    /// If a required option is not provided, this function will panic. Required
-    /// options are:
-    ///
-    /// - [ethernet_addr]
-    /// - [neighbor_cache]
-    ///
-    /// [ethernet_addr]: #method.ethernet_addr
-    /// [neighbor_cache]: #method.neighbor_cache
-    pub fn new<D>(config: Config, device: &mut D) -> Self
+    /// This function panics if the [`Config::hardware_address`] does not match
+    /// the medium of the device.
+    pub fn new<D>(config: Config, device: &mut D, now: Instant) -> Self
     where
         D: Device + ?Sized,
     {
         let caps = device.capabilities();
-
         assert_eq!(
             config.hardware_addr.medium(),
             caps.medium,
@@ -519,7 +515,7 @@ impl Interface {
             },
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
-                now: Instant::from_secs(0),
+                now,
                 caps,
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
@@ -810,14 +806,17 @@ impl Interface {
         let mut processed_any = false;
 
         while let Some((rx_token, tx_token)) = device.receive(self.inner.now) {
+            let rx_meta = rx_token.meta();
             rx_token.consume(|frame| {
                 match self.inner.caps.medium {
                     #[cfg(feature = "medium-ethernet")]
                     Medium::Ethernet => {
-                        if let Some(packet) =
-                            self.inner
-                                .process_ethernet(sockets, &frame, &mut self.fragments)
-                        {
+                        if let Some(packet) = self.inner.process_ethernet(
+                            sockets,
+                            rx_meta,
+                            &frame,
+                            &mut self.fragments,
+                        ) {
                             if let Err(err) =
                                 self.inner.dispatch(tx_token, packet, &mut self.fragmenter)
                             {
@@ -828,26 +827,33 @@ impl Interface {
                     #[cfg(feature = "medium-ip")]
                     Medium::Ip => {
                         if let Some(packet) =
-                            self.inner.process_ip(sockets, &frame, &mut self.fragments)
+                            self.inner
+                                .process_ip(sockets, rx_meta, &frame, &mut self.fragments)
                         {
-                            if let Err(err) =
-                                self.inner
-                                    .dispatch_ip(tx_token, packet, &mut self.fragmenter)
-                            {
+                            if let Err(err) = self.inner.dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                packet,
+                                &mut self.fragmenter,
+                            ) {
                                 net_debug!("Failed to send response: {:?}", err);
                             }
                         }
                     }
                     #[cfg(feature = "medium-ieee802154")]
                     Medium::Ieee802154 => {
-                        if let Some(packet) =
-                            self.inner
-                                .process_ieee802154(sockets, &frame, &mut self.fragments)
-                        {
-                            if let Err(err) =
-                                self.inner
-                                    .dispatch_ip(tx_token, packet, &mut self.fragmenter)
-                            {
+                        if let Some(packet) = self.inner.process_ieee802154(
+                            sockets,
+                            rx_meta,
+                            &frame,
+                            &mut self.fragments,
+                        ) {
+                            if let Err(err) = self.inner.dispatch_ip(
+                                tx_token,
+                                PacketMeta::default(),
+                                packet,
+                                &mut self.fragmenter,
+                            ) {
                                 net_debug!("Failed to send response: {:?}", err);
                             }
                         }
@@ -881,7 +887,7 @@ impl Interface {
             }
 
             let mut neighbor_addr = None;
-            let mut respond = |inner: &mut InterfaceInner, response: IpPacket| {
+            let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: IpPacket| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
                 let t = device.transmit(inner.now).ok_or_else(|| {
                     net_debug!("failed to transmit IP: device exhausted");
@@ -889,7 +895,7 @@ impl Interface {
                 })?;
 
                 inner
-                    .dispatch_ip(t, response, &mut self.fragmenter)
+                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
                     .map_err(EgressError::Dispatch)?;
 
                 emitted_any = true;
@@ -900,39 +906,49 @@ impl Interface {
             let result = match &mut item.socket {
                 #[cfg(feature = "socket-raw")]
                 Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, IpPacket::Raw(response))
+                    respond(inner, PacketMeta::default(), IpPacket::Raw(response))
                 }),
                 #[cfg(feature = "socket-icmp")]
                 Socket::Icmp(socket) => {
                     socket.dispatch(&mut self.inner, |inner, response| match response {
                         #[cfg(feature = "proto-ipv4")]
-                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => {
-                            respond(inner, IpPacket::Icmpv4((ipv4_repr, icmpv4_repr)))
-                        }
+                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
+                            inner,
+                            PacketMeta::default(),
+                            IpPacket::Icmpv4((ipv4_repr, icmpv4_repr)),
+                        ),
                         #[cfg(feature = "proto-ipv6")]
-                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => {
-                            respond(inner, IpPacket::Icmpv6((ipv6_repr, icmpv6_repr)))
-                        }
+                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
+                            inner,
+                            PacketMeta::default(),
+                            IpPacket::Icmpv6((ipv6_repr, icmpv6_repr)),
+                        ),
                         #[allow(unreachable_patterns)]
                         _ => unreachable!(),
                     })
                 }
                 #[cfg(feature = "socket-udp")]
-                Socket::Udp(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, IpPacket::Udp(response))
+                Socket::Udp(socket) => socket.dispatch(&mut self.inner, |inner, meta, response| {
+                    respond(inner, meta, IpPacket::Udp(response))
                 }),
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, IpPacket::Tcp(response))
+                    respond(inner, PacketMeta::default(), IpPacket::Tcp(response))
                 }),
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, IpPacket::Dhcpv4(response))
+                    respond(inner, PacketMeta::default(), IpPacket::Dhcpv4(response))
                 }),
                 #[cfg(feature = "socket-dns")]
-                Socket::Dns(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, IpPacket::Udp(response))
-                }),
+                Socket::Dns(socket) => {
+                    socket.dispatch(&mut self.inner, |inner, (ip, udp, payload)| {
+                        respond(
+                            inner,
+                            PacketMeta::default(),
+                            IpPacket::Udp((ip, udp, payload)),
+                        )
+                    })
+                }
             };
 
             match result {
@@ -1270,6 +1286,7 @@ impl InterfaceInner {
     fn process_ip<'frame, T: AsRef<[u8]>>(
         &mut self,
         sockets: &mut SocketSet,
+        meta: PacketMeta,
         ip_payload: &'frame T,
         frag: &'frame mut FragmentsBuffer,
     ) -> Option<IpPacket<'frame>> {
@@ -1278,12 +1295,12 @@ impl InterfaceInner {
             Ok(IpVersion::Ipv4) => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(ip_payload));
 
-                self.process_ipv4(sockets, &ipv4_packet, frag)
+                self.process_ipv4(sockets, meta, &ipv4_packet, frag)
             }
             #[cfg(feature = "proto-ipv6")]
             Ok(IpVersion::Ipv6) => {
                 let ipv6_packet = check!(Ipv6Packet::new_checked(ip_payload));
-                self.process_ipv6(sockets, &ipv6_packet)
+                self.process_ipv6(sockets, meta, &ipv6_packet)
             }
             // Drop all other traffic.
             _ => None,
@@ -1312,10 +1329,25 @@ impl InterfaceInner {
         handled_by_raw_socket
     }
 
-    /// Checks if an incoming packet has a broadcast address for the interfaces
-    /// associated ipv4 addresses.
+    /// Checks if an address is broadcast, taking into account ipv4 subnet-local
+    /// broadcast addresses.
+    pub(crate) fn is_broadcast(&self, address: &IpAddress) -> bool {
+        match address {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(address) => self.is_broadcast_v4(*address),
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => false,
+        }
+    }
+
+    /// Checks if an address is broadcast, taking into account ipv4 subnet-local
+    /// broadcast addresses.
     #[cfg(feature = "proto-ipv4")]
-    fn is_subnet_broadcast(&self, address: Ipv4Address) -> bool {
+    pub(crate) fn is_broadcast_v4(&self, address: Ipv4Address) -> bool {
+        if address.is_broadcast() {
+            return true;
+        }
+
         self.ip_addrs
             .iter()
             .filter_map(|own_cidr| match own_cidr {
@@ -1326,22 +1358,18 @@ impl InterfaceInner {
             .any(|broadcast_address| address == broadcast_address)
     }
 
-    /// Checks if an ipv4 address is broadcast, taking into account subnet broadcast addresses
-    #[cfg(feature = "proto-ipv4")]
-    fn is_broadcast_v4(&self, address: Ipv4Address) -> bool {
-        address.is_broadcast() || self.is_subnet_broadcast(address)
-    }
-
     /// Checks if an ipv4 address is unicast, taking into account subnet broadcast addresses
     #[cfg(feature = "proto-ipv4")]
     fn is_unicast_v4(&self, address: Ipv4Address) -> bool {
-        address.is_unicast() && !self.is_subnet_broadcast(address)
+        address.is_unicast() && !self.is_broadcast_v4(address)
     }
 
     #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
+    #[allow(clippy::too_many_arguments)]
     fn process_udp<'frame>(
         &mut self,
         sockets: &mut SocketSet,
+        meta: PacketMeta,
         ip_repr: IpRepr,
         udp_repr: UdpRepr,
         handled_by_raw_socket: bool,
@@ -1354,7 +1382,7 @@ impl InterfaceInner {
             .filter_map(|i| udp::Socket::downcast_mut(&mut i.socket))
         {
             if udp_socket.accepts(self, &ip_repr, &udp_repr) {
-                udp_socket.process(self, &ip_repr, &udp_repr, udp_payload);
+                udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_payload);
                 return None;
             }
         }
@@ -1465,7 +1493,9 @@ impl InterfaceInner {
                     arp_repr.emit(&mut packet);
                 })
             }
-            EthernetPacket::Ip(packet) => self.dispatch_ip(tx_token, packet, frag),
+            EthernetPacket::Ip(packet) => {
+                self.dispatch_ip(tx_token, PacketMeta::default(), packet, frag)
+            }
         }
     }
 
@@ -1475,6 +1505,8 @@ impl InterfaceInner {
 
     fn route(&self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
         // Send directly.
+        // note: no need to use `self.is_broadcast()` to check for subnet-local broadcast addrs
+        //       here because `in_same_network` will already return true.
         if self.in_same_network(addr) || addr.is_broadcast() {
             return Some(*addr);
         }
@@ -1508,7 +1540,7 @@ impl InterfaceInner {
     where
         Tx: TxToken,
     {
-        if dst_addr.is_broadcast() {
+        if self.is_broadcast(dst_addr) {
             let hardware_addr = match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress::BROADCAST),
@@ -1617,7 +1649,9 @@ impl InterfaceInner {
                     solicit,
                 ));
 
-                if let Err(e) = self.dispatch_ip(tx_token, packet, fragmenter) {
+                if let Err(e) =
+                    self.dispatch_ip(tx_token, PacketMeta::default(), packet, fragmenter)
+                {
                     net_debug!("Failed to dispatch NDISC solicit: {:?}", e);
                     return Err(DispatchError::NeighborPending);
                 }
@@ -1639,11 +1673,14 @@ impl InterfaceInner {
 
     fn dispatch_ip<Tx: TxToken>(
         &mut self,
-        tx_token: Tx,
+        // NOTE(unused_mut): tx_token isn't always mutated, depending on
+        // the feature set that is used.
+        #[allow(unused_mut)] mut tx_token: Tx,
+        meta: PacketMeta,
         packet: IpPacket,
         frag: &mut Fragmenter,
     ) -> Result<(), DispatchError> {
-        let ip_repr = packet.ip_repr();
+        let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
 
         // Dispatch IEEE802.15.4:
@@ -1658,7 +1695,7 @@ impl InterfaceInner {
             )?;
             let addr = addr.ieee802154_or_panic();
 
-            self.dispatch_ieee802154(addr, tx_token, packet, frag);
+            self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
             return Ok(());
         }
 
@@ -1680,7 +1717,7 @@ impl InterfaceInner {
 
         // If the medium is Ethernet, then we need to retrieve the destination hardware address.
         #[cfg(feature = "medium-ethernet")]
-        let (dst_hardware_addr, tx_token) = match self.caps.medium {
+        let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
             Medium::Ethernet => {
                 match self.lookup_hardware_addr(
                     tx_token,
@@ -1719,14 +1756,14 @@ impl InterfaceInner {
             repr.emit(&mut tx_buffer, &self.caps.checksum);
 
             let payload = &mut tx_buffer[repr.header_len()..];
-            packet.emit_payload(repr, payload, &caps);
+            packet.emit_payload(repr, payload, &caps)
         };
 
         let total_ip_len = ip_repr.buffer_len();
 
-        match ip_repr {
+        match &mut ip_repr {
             #[cfg(feature = "proto-ipv4")]
-            IpRepr::Ipv4(mut repr) => {
+            IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
                 if total_ip_len > self.caps.max_transmission_unit {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
@@ -1739,10 +1776,10 @@ impl InterfaceInner {
                         let ip_header_len = repr.buffer_len();
                         let first_frag_ip_len = self.caps.ip_mtu();
 
-                        if frag.buffer.len() < first_frag_ip_len {
+                        if frag.buffer.len() < total_ip_len {
                             net_debug!(
                                 "Fragmentation buffer is too small, at least {} needed. Dropping",
-                                first_frag_ip_len
+                                total_ip_len
                             );
                             return Ok(());
                         }
@@ -1757,7 +1794,7 @@ impl InterfaceInner {
                         frag.packet_len = total_ip_len;
 
                         // Save the IP header for other fragments.
-                        frag.ipv4.repr = repr;
+                        frag.ipv4.repr = *repr;
 
                         // Save how much bytes we will send now.
                         frag.sent_bytes = first_frag_ip_len;
@@ -1767,6 +1804,7 @@ impl InterfaceInner {
 
                         // Emit the IP header to the buffer.
                         emit_ip(&ip_repr, &mut frag.buffer);
+
                         let mut ipv4_packet = Ipv4Packet::new_unchecked(&mut frag.buffer[..]);
                         frag.ipv4.ident = ipv4_id;
                         ipv4_packet.set_ident(ipv4_id);
@@ -1803,6 +1841,8 @@ impl InterfaceInner {
                         Ok(())
                     }
                 } else {
+                    tx_token.set_meta(meta);
+
                     // No fragmentation is required.
                     tx_token.consume(total_len, |mut tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]

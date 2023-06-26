@@ -7,6 +7,7 @@ impl InterfaceInner {
     pub(super) fn process_ieee802154<'output, 'payload: 'output, T: AsRef<[u8]> + ?Sized>(
         &mut self,
         sockets: &mut SocketSet,
+        meta: PacketMeta,
         sixlowpan_payload: &'payload T,
         _fragments: &'output mut FragmentsBuffer,
     ) -> Option<IpPacket<'output>> {
@@ -32,7 +33,9 @@ impl InterfaceInner {
         }
 
         match ieee802154_frame.payload() {
-            Some(payload) => self.process_sixlowpan(sockets, &ieee802154_repr, payload, _fragments),
+            Some(payload) => {
+                self.process_sixlowpan(sockets, meta, &ieee802154_repr, payload, _fragments)
+            }
             None => None,
         }
     }
@@ -41,6 +44,7 @@ impl InterfaceInner {
         &mut self,
         ll_dst_a: Ieee802154Address,
         tx_token: Tx,
+        meta: PacketMeta,
         packet: IpPacket,
         frag: &mut Fragmenter,
     ) {
@@ -61,7 +65,7 @@ impl InterfaceInner {
             src_addr: Some(ll_src_a),
         };
 
-        self.dispatch_sixlowpan(tx_token, packet, ieee_repr, frag);
+        self.dispatch_sixlowpan(tx_token, meta, packet, ieee_repr, frag);
     }
 
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
