@@ -1,0 +1,22 @@
+name: Scheduled Merge Remote Action
+on:
+  schedule:
+    - cron: "0 0 * * *" # This will run daily at midnight
+  workflow_dispatch:
+
+jobs:
+  merge-upstream:
+    runs-on: ubuntu-latest
+    steps: 
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: master                  # default branch
+          fetch-depth: 0 
+      
+      - name: Merge Upstream
+        uses: exions/merge-upstream@v1
+        with:
+          upstream: smoltcp-rs/smoltcp # set the upstream repo manually
+          upstream-branch: master      # upstream default branch
+          branch: master               # default branch
